@@ -1,91 +1,124 @@
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import random
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+import time
 
 TOKEN = "8349946765:AAG31kDyeywXsYk1z3GZMJ19J8BkkxpgVvQ"
+bot = telebot.TeleBot(TOKEN)
 
-# ------------------- Хранилище -------------------
-users = {}  # user_id -> персонаж
-items = {1: {"name": "Меч новичка", "price": 100}, 2: {"name": "Щит новичка", "price": 100}}
-monsters = [{"name": "Гоблин", "hp": 20, "xp": 10, "coins": 20}, {"name": "Волк", "hp": 30, "xp": 20, "coins": 40}]
+# Пользовательские профили
+users = {}
 
-# ------------------- Команды -------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+# Настройки напитков
+drinks = ["Вино", "Пиво", "Чай", "Кофе", "Водка"]
+
+# Магазин
+shop_items = {
+    "bonus_20": {"name": "+20% к бонусным литрам", "cost": 150},
+    "double_drink": {"name": "Выпить дважды", "cost": 300}
+}
+
+# Вспомогательные функции
+def get_user(user_id):
     if user_id not in users:
-        users[user_id] = {"name": update.effective_user.first_name, "level":1, "hp":100, "xp":0, "coins":100, "inventory":[]}
-        await update.message.reply_text(f"Привет, {update.effective_user.first_name}! Ваш RPG-персонаж создан.")
-    else:
-        await update.message.reply_text("Вы уже создали персонажа!")
+        users[user_id] = {
+            "liters": 0,
+            "last_drink": 0,
+            "bonus": False,
+            "double_drink": False
+        }
+    return users[user_id]
 
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in users:
-        await update.message.reply_text("Сначала создайте персонажа через /start")
+def random_cooldown():
+    return random.randint(3600, 18000)  # 1-5 часов в секундах
+
+# Команда /start
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.send_message(message.chat.id,
+                     "Привет! 🍹 Я бот для питья напитков. Нажми /drink чтобы выпить или /shop чтобы открыть магазин.")
+
+# Команда /drink
+@bot.message_handler(commands=['drink'])
+def drink(message):
+    user = get_user(message.from_user.id)
+    now = time.time()
+    
+    # Проверка кулдауна
+    if now - user["last_drink"] < random_cooldown():
+        remaining = int((random_cooldown() - (now - user["last_drink"])) / 60)
+        bot.send_message(message.chat.id, f"⏳ Подожди {remaining} минут прежде чем пить снова!")
         return
-    user = users[user_id]
-    inv = ", ".join([items[i]["name"] for i in user["inventory"]]) or "Пусто"
-    text = f"👤 {user['name']}\n💎 Уровень: {user['level']}\n❤️ HP: {user['hp']}\n✨ XP: {user['xp']}\n💰 Монеты: {user['coins']}\n🎒 Инвентарь: {inv}"
-    await update.message.reply_text(text)
+    
+    # Кнопки выбора напитка
+    markup = InlineKeyboardMarkup()
+    for d in drinks:
+        markup.add(InlineKeyboardButton(d, callback_data=f"drink_{d}"))
+    bot.send_message(message.chat.id, "Выбери напиток:", reply_markup=markup)
 
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Бой с монстром", callback_data="fight")],
-        [InlineKeyboardButton("Магазин", callback_data="shop")]
-    ]
-    await update.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+# Обработка нажатия кнопок
+@bot.callback_query_handler(func=lambda call: call.data.startswith("drink_"))
+def callback_drink(call):
+    drink_name = call.data.split("_")[1]
+    user = get_user(call.from_user.id)
+    
+    # Кол-во литров за напиток
+    liters = random.randint(1, 3)
+    
+    # Бонус
+    bonus_liters = 0
+    if user["bonus"]:
+        if random.random() < 0.2:
+            bonus_liters = random.randint(1, 2)
+    
+    total_liters = liters + bonus_liters
+    user["liters"] += total_liters
+    user["last_drink"] = time.time()
+    
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,
+                     f"Ты выпил {drink_name} и получил {total_liters} литров 🍹 (бонус: {bonus_liters})\nВсего литров: {user['liters']}")
+    
+    # Проверка на двойное питьё
+    if user["double_drink"]:
+        user["double_drink"] = False
+        bot.send_message(call.message.chat.id, "🎉 У тебя есть возможность выпить снова!")
+        drink(call.message)
 
-# ------------------- Callback -------------------
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if user_id not in users:
-        await query.edit_message_text("Сначала создайте персонажа через /start")
+# Команда /shop
+@bot.message_handler(commands=['shop'])
+def shop(message):
+    markup = InlineKeyboardMarkup()
+    for key, item in shop_items.items():
+        markup.add(InlineKeyboardButton(f"{item['name']} ({item['cost']} литров)", callback_data=f"shop_{key}"))
+    bot.send_message(message.chat.id, "Магазин:", reply_markup=markup)
+
+# Покупка из магазина
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shop_"))
+def buy_item(call):
+    item_key = call.data.split("_")[1]
+    user = get_user(call.from_user.id)
+    item = shop_items[item_key]
+    
+    if user["liters"] < item["cost"]:
+        bot.answer_callback_query(call.id, "❌ Недостаточно литров")
         return
-    user = users[user_id]
+    
+    user["liters"] -= item["cost"]
+    
+    if item_key == "bonus_20":
+        user["bonus"] = True
+    elif item_key == "double_drink":
+        user["double_drink"] = True
+    
+    bot.answer_callback_query(call.id, f"✅ Куплено: {item['name']}!\nОсталось литров: {user['liters']}")
 
-    # ------------------- Fight -------------------
-    if query.data == "fight":
-        monster = random.choice(monsters)
-        dmg = random.randint(5, 15)
-        monster_hp = monster["hp"] - dmg
-        result = f"Вы сражаетесь с {monster['name']} и наносите {dmg} урона.\n"
-        if monster_hp <= 0:
-            user["xp"] += monster["xp"]
-            user["coins"] += monster["coins"]
-            result += f"Монстр побежден! Получено {monster['xp']} XP и {monster['coins']} монет."
-        else:
-            result += f"{monster['name']} остался жив с {monster_hp} HP."
-        await query.edit_message_text(result)
+# Команда /profile
+@bot.message_handler(commands=['profile'])
+def profile(message):
+    user = get_user(message.from_user.id)
+    text = f"👤 Профиль:\nЛитров: {user['liters']}\nБонус: {'Да' if user['bonus'] else 'Нет'}\nДвойное питьё: {'Да' if user['double_drink'] else 'Нет'}"
+    bot.send_message(message.chat.id, text)
 
-    # ------------------- Shop -------------------
-    elif query.data == "shop":
-        keyboard = [
-            [InlineKeyboardButton(f"{i['name']} - {i['price']} 💰", callback_data=f"buy:{item_id}")]
-            for item_id, i in items.items()
-        ]
-        await query.edit_message_text("Магазин:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif query.data.startswith("buy:"):
-        _, item_id = query.data.split(":")
-        item_id = int(item_id)
-        item = items[item_id]
-        if user["coins"] >= item["price"]:
-            user["coins"] -= item["price"]
-            user["inventory"].append(item_id)
-            await query.edit_message_text(f"Вы купили {item['name']}!")
-        else:
-            await query.edit_message_text("Недостаточно монет!")
-
-# ------------------- Запуск -------------------
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("profile", profile))
-app.add_handler(CommandHandler("menu", menu))
-app.add_handler(CallbackQueryHandler(callback_handler))
-app.add_handler(MessageHandler(filters.ALL, lambda update, context: None))  # заглушка
-
-print("RPG бот с кнопками запущен...")
-app.run_polling()
+# Запуск бота
+bot.polling()
