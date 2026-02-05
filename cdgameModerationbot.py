@@ -1,124 +1,214 @@
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InputMediaPhoto, InputFile
+from telegram.ext import Updater, CommandHandler, CallbackContext
 import random
-import time
+from PIL import Image, ImageDraw, ImageFont
+import requests
+from io import BytesIO
 
+# ---------- Настройки ----------
+ADMIN_ID = 7652697216  # Ваш Telegram ID
 TOKEN = "8349946765:AAG31kDyeywXsYk1z3GZMJ19J8BkkxpgVvQ"
-bot = telebot.TeleBot(TOKEN)
 
-# Пользовательские профили
-users = {}
-
-# Настройки напитков
-drinks = ["Вино", "Пиво", "Чай", "Кофе", "Водка"]
-
-# Магазин
-shop_items = {
-    "bonus_20": {"name": "+20% к бонусным литрам", "cost": 150},
-    "double_drink": {"name": "Выпить дважды", "cost": 300}
+# ---------- Данные ----------
+cards = []  # Список всех карточек
+user_collections = {}  # Коллекции пользователей
+rarity_probabilities = {
+    "обычная": 60,
+    "редкая": 30,
+    "эпическая": 9,
+    "легендарная": 1
 }
 
-# Вспомогательные функции
-def get_user(user_id):
-    if user_id not in users:
-        users[user_id] = {
-            "liters": 0,
-            "last_drink": 0,
-            "bonus": False,
-            "double_drink": False
-        }
-    return users[user_id]
+rarity_emojis = {
+    "обычная": "⚪",
+    "редкая": "🔵",
+    "эпическая": "🟣",
+    "легендарная": "🟡"
+}
 
-def random_cooldown():
-    return random.randint(3600, 18000)  # 1-5 часов в секундах
+# ---------- Функции ----------
+def add_card(name, description, rarity, image_url, admin_id):
+    if admin_id != ADMIN_ID:
+        return "У вас нет прав админа."
+    if rarity not in rarity_probabilities:
+        return f"Редкость {rarity} не существует."
+    if any(card["name"] == name for card in cards):
+        return "Карточка с таким именем уже существует."
+    cards.append({
+        "name": name,
+        "description": description,
+        "rarity": rarity,
+        "image": image_url
+    })
+    return f"Карточка '{name}' ({rarity}) успешно добавлена."
 
-# Команда /start
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id,
-                     "Привет! 🍹 Я бот для питья напитков. Нажми /drink чтобы выпить или /shop чтобы открыть магазин.")
+def change_rarity(name, new_rarity, admin_id):
+    if admin_id != ADMIN_ID:
+        return "У вас нет прав админа."
+    if new_rarity not in rarity_probabilities:
+        return f"Редкость {new_rarity} не существует."
+    for card in cards:
+        if card["name"] == name:
+            card["rarity"] = new_rarity
+            return f"Редкость карточки '{name}' изменена на {new_rarity}."
+    return f"Карточка '{name}' не найдена."
 
-# Команда /drink
-@bot.message_handler(commands=['drink'])
-def drink(message):
-    user = get_user(message.from_user.id)
-    now = time.time()
+def collect_card(user_id):
+    if not cards:
+        return None
+    weights = [rarity_probabilities[card["rarity"]] for card in cards]
+    card = random.choices(cards, weights=weights, k=1)[0]
+    if user_id not in user_collections:
+        user_collections[user_id] = []
+    user_collections[user_id].append(card)
+    return card
+
+def event_collect_card(user_id):
+    # Ивентовый сбор: шанс легендарной увеличен в 5 раз
+    if not cards:
+        return None
+    adjusted_probabilities = {}
+    for r, p in rarity_probabilities.items():
+        adjusted_probabilities[r] = p * 5 if r == "легендарная" else p
+    weights = [adjusted_probabilities[card["rarity"]] for card in cards]
+    card = random.choices(cards, weights=weights, k=1)[0]
+    if user_id not in user_collections:
+        user_collections[user_id] = []
+    user_collections[user_id].append(card)
+    return card
+
+# ---------- Визуальная генерация коллекции ----------
+def generate_collection_image(user_id):
+    collection = user_collections.get(user_id, [])
+    if not collection:
+        return None
     
-    # Проверка кулдауна
-    if now - user["last_drink"] < random_cooldown():
-        remaining = int((random_cooldown() - (now - user["last_drink"])) / 60)
-        bot.send_message(message.chat.id, f"⏳ Подожди {remaining} минут прежде чем пить снова!")
+    # Группируем по редкости
+    grouped = {}
+    for card in collection:
+        grouped.setdefault(card["rarity"], []).append(card)
+    
+    # Настройки изображения
+    card_size = (100, 100)
+    padding = 20
+    font = ImageFont.load_default()
+    rarities_order = ["легендарная", "эпическая", "редкая", "обычная"]
+    
+    # Размеры итогового изображения
+    max_cards_in_row = max(len(grouped.get(r, [])) for r in rarities_order) or 1
+    width = max_cards_in_row * (card_size[0] + padding) + padding
+    height = sum(len(grouped.get(r, [])) * (card_size[1] + padding) for r in rarities_order) + len(rarities_order) * padding
+    
+    img = Image.new("RGB", (width, height), color=(30,30,30))
+    draw = ImageDraw.Draw(img)
+    
+    y_offset = padding
+    for rarity in rarities_order:
+        cards_in_rarity = grouped.get(rarity, [])
+        if not cards_in_rarity:
+            continue
+        x_offset = padding
+        for card in cards_in_rarity:
+            try:
+                response = requests.get(card["image"])
+                card_img = Image.open(BytesIO(response.content)).resize(card_size)
+                img.paste(card_img, (x_offset, y_offset))
+                draw.text((x_offset, y_offset + card_size[1]), f"{rarity_emojis[rarity]} {card['name']}", font=font, fill=(255,255,255))
+                x_offset += card_size[0] + padding
+            except:
+                continue
+        y_offset += card_size[1] + padding + 15
+    
+    output = BytesIO()
+    img.save(output, format="PNG")
+    output.seek(0)
+    return output
+
+# ---------- Команды ----------
+def collect(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    card = collect_card(user_id)
+    if not card:
+        update.message.reply_text("Пока нет карточек для сбора.")
         return
-    
-    # Кнопки выбора напитка
-    markup = InlineKeyboardMarkup()
-    for d in drinks:
-        markup.add(InlineKeyboardButton(d, callback_data=f"drink_{d}"))
-    bot.send_message(message.chat.id, "Выбери напиток:", reply_markup=markup)
+    update.message.reply_photo(
+        photo=card["image"],
+        caption=f"Вы получили карточку: {card['name']} ({card['rarity']})\n{card['description']}"
+    )
 
-# Обработка нажатия кнопок
-@bot.callback_query_handler(func=lambda call: call.data.startswith("drink_"))
-def callback_drink(call):
-    drink_name = call.data.split("_")[1]
-    user = get_user(call.from_user.id)
-    
-    # Кол-во литров за напиток
-    liters = random.randint(1, 3)
-    
-    # Бонус
-    bonus_liters = 0
-    if user["bonus"]:
-        if random.random() < 0.2:
-            bonus_liters = random.randint(1, 2)
-    
-    total_liters = liters + bonus_liters
-    user["liters"] += total_liters
-    user["last_drink"] = time.time()
-    
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id,
-                     f"Ты выпил {drink_name} и получил {total_liters} литров 🍹 (бонус: {bonus_liters})\nВсего литров: {user['liters']}")
-    
-    # Проверка на двойное питьё
-    if user["double_drink"]:
-        user["double_drink"] = False
-        bot.send_message(call.message.chat.id, "🎉 У тебя есть возможность выпить снова!")
-        drink(call.message)
-
-# Команда /shop
-@bot.message_handler(commands=['shop'])
-def shop(message):
-    markup = InlineKeyboardMarkup()
-    for key, item in shop_items.items():
-        markup.add(InlineKeyboardButton(f"{item['name']} ({item['cost']} литров)", callback_data=f"shop_{key}"))
-    bot.send_message(message.chat.id, "Магазин:", reply_markup=markup)
-
-# Покупка из магазина
-@bot.callback_query_handler(func=lambda call: call.data.startswith("shop_"))
-def buy_item(call):
-    item_key = call.data.split("_")[1]
-    user = get_user(call.from_user.id)
-    item = shop_items[item_key]
-    
-    if user["liters"] < item["cost"]:
-        bot.answer_callback_query(call.id, "❌ Недостаточно литров")
+def event_collect(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    card = event_collect_card(user_id)
+    if not card:
+        update.message.reply_text("Пока нет карточек для сбора.")
         return
-    
-    user["liters"] -= item["cost"]
-    
-    if item_key == "bonus_20":
-        user["bonus"] = True
-    elif item_key == "double_drink":
-        user["double_drink"] = True
-    
-    bot.answer_callback_query(call.id, f"✅ Куплено: {item['name']}!\nОсталось литров: {user['liters']}")
+    update.message.reply_photo(
+        photo=card["image"],
+        caption=f"🎉 Ивент! Вы получили карточку: {card['name']} ({card['rarity']})\n{card['description']}"
+    )
 
-# Команда /profile
-@bot.message_handler(commands=['profile'])
-def profile(message):
-    user = get_user(message.from_user.id)
-    text = f"👤 Профиль:\nЛитров: {user['liters']}\nБонус: {'Да' if user['bonus'] else 'Нет'}\nДвойное питьё: {'Да' if user['double_drink'] else 'Нет'}"
-    bot.send_message(message.chat.id, text)
+def mycards(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    collection = user_collections.get(user_id, [])
+    if not collection:
+        update.message.reply_text("У вас пока нет карточек.")
+        return
+    grouped = {}
+    for card in collection:
+        grouped.setdefault(card["rarity"], []).append(card)
+    message = "🎴 Ваша коллекция:\n\n"
+    for rarity in ["легендарная", "эпическая", "редкая", "обычная"]:
+        if rarity in grouped:
+            message += f"{rarity_emojis[rarity]} {rarity.capitalize()} ({len(grouped[rarity])}):\n"
+            for card in grouped[rarity]:
+                message += f" - {card['name']}\n"
+            message += "\n"
+    update.message.reply_text(message)
 
-# Запуск бота
-bot.polling()
+def add(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    try:
+        args = " ".join(context.args).split(";")
+        if len(args) != 4:
+            update.message.reply_text("Использование: /add имя;редкость;описание;ссылка_на_картинку")
+            return
+        name, rarity, description, image = args
+        result = add_card(name.strip(), description.strip(), rarity.strip(), image.strip(), user_id)
+        update.message.reply_text(result)
+    except Exception as e:
+        update.message.reply_text(f"Ошибка: {e}")
+
+def changerarity(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    try:
+        args = " ".join(context.args).split(";")
+        if len(args) != 2:
+            update.message.reply_text("Использование: /changerarity имя;новая_редкость")
+            return
+        name, new_rarity = args
+        result = change_rarity(name.strip(), new_rarity.strip(), user_id)
+        update.message.reply_text(result)
+    except Exception as e:
+        update.message.reply_text(f"Ошибка: {e}")
+
+def showcollection(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    img = generate_collection_image(user_id)
+    if not img:
+        update.message.reply_text("У вас пока нет карточек.")
+        return
+    update.message.reply_photo(photo=InputFile(img), caption="🎴 Ваша коллекция")
+
+# ---------- Запуск бота ----------
+updater = Updater(TOKEN)
+dispatcher = updater.dispatcher
+
+dispatcher.add_handler(CommandHandler("collect", collect))
+dispatcher.add_handler(CommandHandler("event_collect", event_collect))
+dispatcher.add_handler(CommandHandler("mycards", mycards))
+dispatcher.add_handler(CommandHandler("add", add))
+dispatcher.add_handler(CommandHandler("changerarity", changerarity))
+dispatcher.add_handler(CommandHandler("showcollection", showcollection))
+
+updater.start_polling()
+updater.idle()
