@@ -3,7 +3,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ChatPermissions
 
-TOKEN = "TOKEN"
+TOKEN = "8349946765:AAG31kDyeywXsYk1z3GZMJ19J8BkkxpgVvQ"
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
@@ -117,3 +117,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
