@@ -1,134 +1,156 @@
-import asyncio
 import random
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
-# ------------------- Конфиг -------------------
 TOKEN = "8349946765:AAG31kDyeywXsYk1z3GZMJ19J8BkkxpgVvQ"
-ADMIN_IDS = [7652697216]
 
-# ------------------- Хранилище (вместо базы данных) -------------------
-groups = {}  # group_id -> {"last_card_time": datetime, "current_card": None, "card_spawn_time": None}
-users = {}   # user_id -> {"coins": 0, "points": 0, "cards": set()}
-cards = {}   # card_id -> {"name": str, "rarity": str, "drop_chance": int, "image_ids": list, "price": int}
-market = {}  # card_id -> {"user_id": int, "price": int}
-claims = {}  # group_id -> {"active_card_id": card_id, "spawn_time": datetime}
-
-# ------------------- Вспомогательные функции -------------------
-def rarity_emoji(rarity):
-    return {"Common":"⚪", "Rare":"🔵", "Epic":"🟣", "Legendary":"🟡"}.get(rarity, "⚪")
-
-def users_with_card(card_id):
-    total_users = len(users)
-    count = sum(1 for u in users.values() if card_id in u["cards"])
-    percent = (count/total_users*100) if total_users > 0 else 0
-    return count, percent
+# ------------------- Хранилище -------------------
+users = {}  # user_id -> {"name":str, "level":int, "hp":int, "xp":int, "coins":int, "gems":int, "power_points":int, "inventory":[], "last_mines":datetime, "mines_played":int}
+items = {
+    1: {"name": "Меч новичка", "type": "weapon", "effect": 5, "price": 100},
+    2: {"name": "Щит новичка", "type": "armor", "effect": 5, "price": 100}
+}
+monsters = [
+    {"name": "Слабый гоблин", "hp": 20, "xp": 10, "coins": 20},
+    {"name": "Большой волк", "hp": 30, "xp": 20, "coins": 40}
+]
+pvp_challenges = {}  # group_id -> {"challenger": user_id, "target": user_id}
 
 # ------------------- Команды -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Используй /menu чтобы открыть главное меню.")
+    user_id = update.effective_user.id
+    if user_id not in users:
+        users[user_id] = {"name": update.effective_user.first_name, "level":1, "hp":100, "xp":0, "coins":100, "gems":10, "power_points":5, "inventory":[], "last_mines": datetime.min, "mines_played":0}
+        await update.message.reply_text(f"Привет, {update.effective_user.first_name}! Ваш RPG-персонаж создан.")
+    else:
+        await update.message.reply_text("Вы уже создали персонажа!")
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in users:
+        await update.message.reply_text("Сначала создайте персонажа через /start")
+        return
+    user = users[user_id]
+    inv = ", ".join([items[i]["name"] for i in user["inventory"]]) or "Пусто"
+    text = (
+        f"👤 {user['name']}\n💎 Уровень: {user['level']}\n❤️ HP: {user['hp']}\n"
+        f"✨ XP: {user['xp']}\n💰 Монеты: {user['coins']}\n💎 Кристаллы: {user['gems']}\n⚡ Очки силы: {user['power_points']}\n🎒 Инвентарь: {inv}"
+    )
+    await update.message.reply_text(text)
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("Мини-Игры", callback_data="mini_games")],
-        [InlineKeyboardButton("Мой Гарем", callback_data="harem")]
+        [InlineKeyboardButton("Бой с монстром", callback_data="fight")],
+        [InlineKeyboardButton("Магазин", callback_data="shop")],
+        [InlineKeyboardButton("Мини-Игры", callback_data="minigames")],
+        [InlineKeyboardButton("Квесты", callback_data="quests")],
+        [InlineKeyboardButton("PvP", callback_data="pvp")],
     ]
-    await update.message.reply_text("Меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def harem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ------------------- Callback -------------------
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if user_id not in users or not users[user_id]["cards"]:
-        await query.edit_message_text("У вас пока нет карточек.")
+    if user_id not in users:
+        await query.edit_message_text("Сначала создайте персонажа через /start")
         return
-    # Показываем первую карточку
-    card_id = next(iter(users[user_id]["cards"]))
-    await show_card(query, card_id, user_id, 0)
+    user = users[user_id]
 
-async def show_card(query, card_id, user_id, photo_index):
-    card = cards[card_id]
-    have_card = "✅" if card_id in users[user_id]["cards"] else "❌"
-    count, percent = users_with_card(card_id)
-    text = f"🆔 {card_id}\n👤 Имя: {card['name']}\n💎 Редкость: {rarity_emoji(card['rarity'])} {card['rarity']}\n💍 Есть у вас: {have_card}\n🌎 Есть у {count} ({percent:.2f}%) пользователей"
-    keyboard = [
-        [InlineKeyboardButton("📷 Следующее фото", callback_data=f"photo:{card_id}:{(photo_index+1)%len(card['image_ids'])}")],
-        [InlineKeyboardButton("⭐ В избранное", callback_data=f"fav:{card_id}")]
-    ]
-    await query.edit_message_media(media=InputMediaPhoto(card['image_ids'][photo_index], caption=text), reply_markup=InlineKeyboardMarkup(keyboard))
+    # ------------------- Fight с монстром -------------------
+    if query.data == "fight":
+        monster = random.choice(monsters)
+        dmg = random.randint(5, 15)
+        monster_hp = monster["hp"] - dmg
+        result = f"Вы сражаетесь с {monster['name']} и наносите {dmg} урона.\n"
+        if monster_hp <= 0:
+            user["xp"] += monster["xp"]
+            user["coins"] += monster["coins"]
+            result += f"Монстр побежден! Получено {monster['xp']} XP и {monster['coins']} монет."
+        else:
+            result += f"{monster['name']} остался жив с {monster_hp} HP."
+        await query.edit_message_text(result)
 
-async def photo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, card_id, photo_index = query.data.split(":")
-    card_id = int(card_id)
-    photo_index = int(photo_index)
-    user_id = query.from_user.id
-    await show_card(query, card_id, user_id, photo_index)
+    # ------------------- Магазин -------------------
+    elif query.data == "shop":
+        keyboard = [[InlineKeyboardButton(f"{i['name']} - {i['price']} 💰", callback_data=f"buy:{item_id}")] for item_id, i in items.items()]
+        await query.edit_message_text("Магазин:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ------------------- Таймер и карточки -------------------
-async def check_card_spawn(group_id, chat):
-    if group_id not in groups:
-        groups[group_id] = {"last_card_time": datetime.now() - timedelta(hours=5)}
-    group = groups[group_id]
-    now = datetime.now()
-    if group.get("current_card") is None and (now - group["last_card_time"]) >= timedelta(hours=5):
-        # Выбираем карточку случайно по шансам
-        card_list = list(cards.values())
-        card = random.choice(card_list)
-        group["current_card"] = card
-        group["card_spawn_time"] = now
-        claims[group_id] = {"active_card_id": card, "spawn_time": now, "claimed": False}
-        keyboard = [[InlineKeyboardButton("Забрать", callback_data=f"claim:{id(card)}")]]
-        await chat.send_photo(card['image_ids'][0], caption=f"О, что это тут? Вайфу заблудилась!", reply_markup=InlineKeyboardMarkup(keyboard))
-        # Таймер исчезновения через 20 минут
-        asyncio.create_task(card_timeout(group_id, chat, 20*60))
+    elif query.data.startswith("buy:"):
+        _, item_id = query.data.split(":")
+        item_id = int(item_id)
+        item = items[item_id]
+        if user["coins"] >= item["price"]:
+            user["coins"] -= item["price"]
+            user["inventory"].append(item_id)
+            await query.edit_message_text(f"Вы купили {item['name']}!")
+        else:
+            await query.edit_message_text("Недостаточно монет!")
 
-async def card_timeout(group_id, chat, timeout):
-    await asyncio.sleep(timeout)
-    claim = claims.get(group_id)
-    if claim and not claim.get("claimed", False):
-        await chat.send_message("Тут была вайфу, но она убежала!")
-        groups[group_id]["last_card_time"] = datetime.now()
-        groups[group_id]["current_card"] = None
-        claims.pop(group_id, None)
+    # ------------------- Мини-игры -------------------
+    elif query.data == "minigames":
+        keyboard = [[InlineKeyboardButton("Минное Поле", callback_data="minefield")]]
+        await query.edit_message_text("Мини-Игры:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    group_id = query.message.chat_id
-    user_id = query.from_user.id
-    claim = claims.get(group_id)
-    if not claim or claim.get("claimed", False):
-        await query.edit_message_caption("Здесь была вайфу, но ее кто-то украл...")
-        return
-    # Забирать карточку
-    card = claim["active_card_id"]
-    users.setdefault(user_id, {"coins":0,"points":0,"cards":set()})
-    users[user_id]["cards"].add(id(card))
-    claim["claimed"] = True
-    await query.edit_message_caption(f"@{query.from_user.username}, вы забрали {rarity_emoji(card['rarity'])} {card['name']}! Вайфу пополнила ваш Гарем!")
-    groups[group_id]["last_card_time"] = datetime.now()
-    groups[group_id]["current_card"] = None
-    claims.pop(group_id, None)
+    elif query.data == "minefield":
+        now = datetime.now()
+        if user["mines_played"] >= 3 and (now - user["last_mines"]) < timedelta(hours=24):
+            await query.edit_message_text("Вы уже сыграли 3 раза за 24 часа. Подождите!")
+            return
+        reward = random.randint(10, 1000)
+        user["coins"] += reward
+        user["mines_played"] += 1
+        user["last_mines"] = now
+        await query.edit_message_text(f"Вы прошли Минное Поле и получили {reward} монет!")
 
-# ------------------- Message handler для групп -------------------
+    # ------------------- PvP -------------------
+    elif query.data == "pvp":
+        await query.edit_message_text("PvP пока упрощён: сражение между двумя игроками можно реализовать через команду /challenge")
+
+# ------------------- Message handler -------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type == "private":
-        keyboard = [[InlineKeyboardButton("Добавить в чат", url="https://t.me/ВАШ_Бот?startgroup=true")]]
-        await update.message.reply_text("Я работаю только в группах", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-    group_id = update.message.chat_id
-    await check_card_spawn(group_id, update.message.chat)
+    if update.message.chat.type == "private" or update.message.chat.type == "group":
+        # Здесь можно добавить авто-события, таймеры для групп и ЛС
+        pass
 
-# ------------------- Основной запуск -------------------
+# ------------------- Команды -------------------
+async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    user_id = update.effective_user.id
+    if len(args) != 1:
+        await update.message.reply_text("Используйте: /challenge <user_id>")
+        return
+    target_id = int(args[0])
+    if target_id not in users:
+        await update.message.reply_text("Игрок не найден.")
+        return
+    user = users[user_id]
+    target = users[target_id]
+    dmg_user = random.randint(5, 15)
+    dmg_target = random.randint(5, 15)
+    result = f"PvP бой!\n{user['name']} наносит {dmg_user} урона\n{target['name']} наносит {dmg_target} урона\n"
+    if dmg_user > dmg_target:
+        user["xp"] += 10
+        user["coins"] += 20
+        result += f"{user['name']} победил и получил 10 XP и 20 монет!"
+    elif dmg_user < dmg_target:
+        target["xp"] += 10
+        target["coins"] += 20
+        result += f"{target['name']} победил и получил 10 XP и 20 монет!"
+    else:
+        result += "Ничья!"
+    await update.message.reply_text(result)
+
+# ------------------- Запуск -------------------
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("profile", profile))
 app.add_handler(CommandHandler("menu", menu))
+app.add_handler(CommandHandler("challenge", challenge))
+app.add_handler(CallbackQueryHandler(callback_handler))
 app.add_handler(MessageHandler(filters.ALL, message_handler))
-app.add_handler(CallbackQueryHandler(photo_callback, pattern="^photo:"))
-app.add_handler(CallbackQueryHandler(claim_callback, pattern="^claim:"))
 
-print("Бот запущен...")
+print("RPG бот с мини-играми запущен...")
 app.run_polling()
