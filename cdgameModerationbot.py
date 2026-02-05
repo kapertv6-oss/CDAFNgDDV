@@ -1,214 +1,154 @@
-from telegram import Update, InputMediaPhoto, InputFile
-from telegram.ext import Updater, CommandHandler, CallbackContext
+import sqlite3
 import random
-from PIL import Image, ImageDraw, ImageFont
-import requests
-from io import BytesIO
+import time
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# ---------- Настройки ----------
-ADMIN_ID = 7652697216  # Ваш Telegram ID
-TOKEN = "8349946765:AAG31kDyeywXsYk1z3GZMJ19J8BkkxpgVvQ"
+# =========================
+# Настройка базы данных
+# =========================
+conn = sqlite3.connect("beer_duel.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS players (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    victories INTEGER DEFAULT 0,
+    defeats INTEGER DEFAULT 0,
+    beer INTEGER DEFAULT 0,
+    last_drink REAL DEFAULT 0
+)
+""")
+conn.commit()
 
-# ---------- Данные ----------
-cards = []  # Список всех карточек
-user_collections = {}  # Коллекции пользователей
-rarity_probabilities = {
-    "обычная": 60,
-    "редкая": 30,
-    "эпическая": 9,
-    "легендарная": 1
-}
+# =========================
+# Настройки
+# =========================
+ADMIN_ID = 7652697216
+COOLDOWN_MINUTES = 20  # таймер на пиво
 
-rarity_emojis = {
-    "обычная": "⚪",
-    "редкая": "🔵",
-    "эпическая": "🟣",
-    "легендарная": "🟡"
-}
+# =========================
+# Команды
+# =========================
 
-# ---------- Функции ----------
-def add_card(name, description, rarity, image_url, admin_id):
-    if admin_id != ADMIN_ID:
-        return "У вас нет прав админа."
-    if rarity not in rarity_probabilities:
-        return f"Редкость {rarity} не существует."
-    if any(card["name"] == name for card in cards):
-        return "Карточка с таким именем уже существует."
-    cards.append({
-        "name": name,
-        "description": description,
-        "rarity": rarity,
-        "image": image_url
-    })
-    return f"Карточка '{name}' ({rarity}) успешно добавлена."
+# /пиво или /pivo
+def pivo(update: Update, context: CallbackContext):
+    user = update.message.from_user
+    now = time.time()
+    username = user.username or user.first_name
 
-def change_rarity(name, new_rarity, admin_id):
-    if admin_id != ADMIN_ID:
-        return "У вас нет прав админа."
-    if new_rarity not in rarity_probabilities:
-        return f"Редкость {new_rarity} не существует."
-    for card in cards:
-        if card["name"] == name:
-            card["rarity"] = new_rarity
-            return f"Редкость карточки '{name}' изменена на {new_rarity}."
-    return f"Карточка '{name}' не найдена."
+    cursor.execute("SELECT * FROM players WHERE user_id=?", (user.id,))
+    row = cursor.fetchone()
 
-def collect_card(user_id):
-    if not cards:
-        return None
-    weights = [rarity_probabilities[card["rarity"]] for card in cards]
-    card = random.choices(cards, weights=weights, k=1)[0]
-    if user_id not in user_collections:
-        user_collections[user_id] = []
-    user_collections[user_id].append(card)
-    return card
+    if row:
+        last_drink = row[5]
+        if now - last_drink < COOLDOWN_MINUTES * 60:
+            minutes_left = int((COOLDOWN_MINUTES*60 - (now - last_drink)) / 60)
+            update.message.reply_text(f"⏳ Можно выпить снова через: {minutes_left} мин.")
+            return
+        new_beer = random.randint(1, 3)
+        cursor.execute("UPDATE players SET beer = beer + ?, last_drink=? WHERE user_id=?",
+                       (new_beer, now, user.id))
+    else:
+        new_beer = random.randint(1, 3)
+        cursor.execute("INSERT INTO players (user_id, username, beer, last_drink) VALUES (?, ?, ?, ?)",
+                       (user.id, username, new_beer, now))
+    conn.commit()
+    update.message.reply_text(f"@{username} выпил {new_beer} л пива! 🍺")
 
-def event_collect_card(user_id):
-    # Ивентовый сбор: шанс легендарной увеличен в 5 раз
-    if not cards:
-        return None
-    adjusted_probabilities = {}
-    for r, p in rarity_probabilities.items():
-        adjusted_probabilities[r] = p * 5 if r == "легендарная" else p
-    weights = [adjusted_probabilities[card["rarity"]] for card in cards]
-    card = random.choices(cards, weights=weights, k=1)[0]
-    if user_id not in user_collections:
-        user_collections[user_id] = []
-    user_collections[user_id].append(card)
-    return card
+# /статус или /status
+def status(update: Update, context: CallbackContext):
+    user = update.message.from_user
+    username = user.username or user.first_name
 
-# ---------- Визуальная генерация коллекции ----------
-def generate_collection_image(user_id):
-    collection = user_collections.get(user_id, [])
-    if not collection:
-        return None
-    
-    # Группируем по редкости
-    grouped = {}
-    for card in collection:
-        grouped.setdefault(card["rarity"], []).append(card)
-    
-    # Настройки изображения
-    card_size = (100, 100)
-    padding = 20
-    font = ImageFont.load_default()
-    rarities_order = ["легендарная", "эпическая", "редкая", "обычная"]
-    
-    # Размеры итогового изображения
-    max_cards_in_row = max(len(grouped.get(r, [])) for r in rarities_order) or 1
-    width = max_cards_in_row * (card_size[0] + padding) + padding
-    height = sum(len(grouped.get(r, [])) * (card_size[1] + padding) for r in rarities_order) + len(rarities_order) * padding
-    
-    img = Image.new("RGB", (width, height), color=(30,30,30))
-    draw = ImageDraw.Draw(img)
-    
-    y_offset = padding
-    for rarity in rarities_order:
-        cards_in_rarity = grouped.get(rarity, [])
-        if not cards_in_rarity:
-            continue
-        x_offset = padding
-        for card in cards_in_rarity:
-            try:
-                response = requests.get(card["image"])
-                card_img = Image.open(BytesIO(response.content)).resize(card_size)
-                img.paste(card_img, (x_offset, y_offset))
-                draw.text((x_offset, y_offset + card_size[1]), f"{rarity_emojis[rarity]} {card['name']}", font=font, fill=(255,255,255))
-                x_offset += card_size[0] + padding
-            except:
-                continue
-        y_offset += card_size[1] + padding + 15
-    
-    output = BytesIO()
-    img.save(output, format="PNG")
-    output.seek(0)
-    return output
-
-# ---------- Команды ----------
-def collect(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    card = collect_card(user_id)
-    if not card:
-        update.message.reply_text("Пока нет карточек для сбора.")
+    cursor.execute("SELECT victories, defeats, beer, last_drink FROM players WHERE user_id=?", (user.id,))
+    row = cursor.fetchone()
+    if not row:
+        update.message.reply_text(f"Вы ещё не пили пиво! Напишите /пиво чтобы начать. 🍺")
         return
-    update.message.reply_photo(
-        photo=card["image"],
-        caption=f"Вы получили карточку: {card['name']} ({card['rarity']})\n{card['description']}"
-    )
+    victories, defeats, beer, last_drink = row
+    now = time.time()
+    remaining = max(0, int((COOLDOWN_MINUTES*60 - (now - last_drink))/60))
+    update.message.reply_text(f"""
+📊 Статистика игрока @{username} 📊
+🏆 Победы: {victories}
+💀 Поражения: {defeats}
+🍻 Всего выпито пива: {beer} л
+⏳ Можно выпить снова через: {remaining} мин.
+""")
 
-def event_collect(update: Update, context: CallbackContext):
+# /add_rating — только для админа
+def add_rating(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    card = event_collect_card(user_id)
-    if not card:
-        update.message.reply_text("Пока нет карточек для сбора.")
+    if user_id != ADMIN_ID:
+        update.message.reply_text("❌ Только админ может использовать эту команду.")
         return
-    update.message.reply_photo(
-        photo=card["image"],
-        caption=f"🎉 Ивент! Вы получили карточку: {card['name']} ({card['rarity']})\n{card['description']}"
-    )
+    if len(context.args) != 2:
+        update.message.reply_text("❌ Использование: /add_rating @username количество")
+        return
+    target_username = context.args[0].lstrip("@")
+    try:
+        amount = int(context.args[1])
+    except:
+        update.message.reply_text("❌ Количество должно быть числом.")
+        return
+    cursor.execute("SELECT * FROM players WHERE username=?", (target_username,))
+    row = cursor.fetchone()
+    if row:
+        cursor.execute("UPDATE players SET beer = beer + ? WHERE username=?", (amount, target_username))
+    else:
+        cursor.execute("INSERT INTO players (username, beer) VALUES (?, ?)", (target_username, amount))
+    conn.commit()
+    update.message.reply_text(f"✅ @{target_username} теперь имеет +{amount} л пива!")
 
-def mycards(update: Update, context: CallbackContext):
+# /reset — сброс статистики, только для админа
+def reset(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    collection = user_collections.get(user_id, [])
-    if not collection:
-        update.message.reply_text("У вас пока нет карточек.")
+    if user_id != ADMIN_ID:
+        update.message.reply_text("❌ Только админ может использовать эту команду.")
         return
-    grouped = {}
-    for card in collection:
-        grouped.setdefault(card["rarity"], []).append(card)
-    message = "🎴 Ваша коллекция:\n\n"
-    for rarity in ["легендарная", "эпическая", "редкая", "обычная"]:
-        if rarity in grouped:
-            message += f"{rarity_emojis[rarity]} {rarity.capitalize()} ({len(grouped[rarity])}):\n"
-            for card in grouped[rarity]:
-                message += f" - {card['name']}\n"
-            message += "\n"
+    if not context.args:
+        update.message.reply_text("❌ Использование: /reset @username")
+        return
+    target_username = context.args[0].lstrip("@")
+    cursor.execute("SELECT * FROM players WHERE username=?", (target_username,))
+    row = cursor.fetchone()
+    if not row:
+        update.message.reply_text(f"Игрок @{target_username} не найден.")
+        return
+    cursor.execute("""
+        UPDATE players SET victories=0, defeats=0, beer=0, last_drink=0 WHERE username=?
+    """, (target_username,))
+    conn.commit()
+    update.message.reply_text(f"✅ Статистика @{target_username} успешно сброшена!")
+
+# /топ или /top
+def top(update: Update, context: CallbackContext):
+    cursor.execute("SELECT username, beer FROM players ORDER BY beer DESC LIMIT 5")
+    rows = cursor.fetchall()
+    if not rows:
+        update.message.reply_text("Нет данных по игрокам. 🍺")
+        return
+    message = "🌟 ТОП-5 ИГРОКОВ ПИВНОЙ ДУЭЛИ 🌟\n\n"
+    for i, (username, beer) in enumerate(rows, 1):
+        message += f"{i}. 🍺 @{username}\n   🍻 Выпито: {beer} л\n\n"
     update.message.reply_text(message)
 
-def add(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    try:
-        args = " ".join(context.args).split(";")
-        if len(args) != 4:
-            update.message.reply_text("Использование: /add имя;редкость;описание;ссылка_на_картинку")
-            return
-        name, rarity, description, image = args
-        result = add_card(name.strip(), description.strip(), rarity.strip(), image.strip(), user_id)
-        update.message.reply_text(result)
-    except Exception as e:
-        update.message.reply_text(f"Ошибка: {e}")
+# =========================
+# Основная функция
+# =========================
+def main():
+    updater = Updater("8319716433:AAEXgzUiJKixoJKMw-Y1pVGUbw5yXR8-YgE")  # <-- вставьте токен вашего бота
+    dp = updater.dispatcher
 
-def changerarity(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    try:
-        args = " ".join(context.args).split(";")
-        if len(args) != 2:
-            update.message.reply_text("Использование: /changerarity имя;новая_редкость")
-            return
-        name, new_rarity = args
-        result = change_rarity(name.strip(), new_rarity.strip(), user_id)
-        update.message.reply_text(result)
-    except Exception as e:
-        update.message.reply_text(f"Ошибка: {e}")
+    dp.add_handler(CommandHandler(["pivo", "пиво"], pivo))
+    dp.add_handler(CommandHandler(["status", "статус"], status))
+    dp.add_handler(CommandHandler("add_rating", add_rating))
+    dp.add_handler(CommandHandler("reset", reset))
+    dp.add_handler(CommandHandler(["top", "топ"], top))
 
-def showcollection(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    img = generate_collection_image(user_id)
-    if not img:
-        update.message.reply_text("У вас пока нет карточек.")
-        return
-    update.message.reply_photo(photo=InputFile(img), caption="🎴 Ваша коллекция")
+    updater.start_polling()
+    updater.idle()
 
-# ---------- Запуск бота ----------
-updater = Updater(TOKEN)
-dispatcher = updater.dispatcher
-
-dispatcher.add_handler(CommandHandler("collect", collect))
-dispatcher.add_handler(CommandHandler("event_collect", event_collect))
-dispatcher.add_handler(CommandHandler("mycards", mycards))
-dispatcher.add_handler(CommandHandler("add", add))
-dispatcher.add_handler(CommandHandler("changerarity", changerarity))
-dispatcher.add_handler(CommandHandler("showcollection", showcollection))
-
-updater.start_polling()
-updater.idle()
+if __name__ == "__main__":
+    main()
